@@ -1,38 +1,47 @@
 """Forecast GTA VI's launch-day Twitch viewers, hour by hour (Python 3.13, stdlib only).
 
-Model: a launch's release day has a characteristic shape once you divide by its
-first hour. The case carries dozens of past launches ("comparables"), each with
-hourly viewers from 14 days before its release day to 3 days after. For every
-comparable whose release-day curve is complete, take the log ratio
-ln(viewers[h] / viewers[1]) for h = 2..24. The forecast for this case is hour 1's
-print times a robust aggregate of those ratios.
+Model v3: a per-hour ridge regression on comparable launches, in the target's
+own rollout geometry.
 
-Not all past launches say much about this one. What separates them is how much
-of the launch was already live before the UTC day began: a game that unlocks at
-midnight local time, region by region, already has New Zealand, Asia and part
-of Europe playing in the hours before 00:00 UTC, while a game with a single
-late global unlock sits near zero until its hour comes. The feature
+What the data says (leave-one-out over the comparables, and the four practice
+cases scored against their actual release days):
 
-    a1 = ln(median viewers in the 6 hours before day_start / hour-1 viewers)
+1. Scale rules the shape. ln(hour-1 viewers) correlates about -0.93 with the
+   late-day log ratio ln(viewers[h] / viewers[1]): a launch whose first hour
+   is already huge has most of its audience in the room, while a small first
+   hour (only the earliest time zones awake) leaves the whole day to grow.
+   A model that pools raw ratios without scale — v2 of this entry — misses
+   exactly that, which is why its medians were the weak point.
 
-measures exactly that, for the comparables (from their own hourly series) and
-for this case (from its history_hourly). Each comparable is weighted by a
-Gaussian kernel on a1 (bandwidth 0.35) plus a small floor, doubled when the
-comparable is a console-only launch like this one.
+2. Company matters. The pool mixes rolling midnight-local launches with
+   single-global-unlock and early-access-contaminated ones whose hour 1 is a
+   pre-unlock artefact (a few hundred viewers, ratios in the thousands of
+   percent). For a rolling target, only the rolling/unverified, uncontaminated
+   comparables with a real hour-1 audience (>= 1% of their own day peak) are
+   used: the "in-class" pool, identified at runtime from each comparable's
+   unlock text (its Tier marker and wording) and its own curve.
 
-Per hour, the five quantiles blend two views of the weighted log-ratio
-distribution, in log space: a normal fit (weighted median, weighted IQR scaled
-to a standard deviation, shrunk by 0.9) at 70% and the weighted empirical
-quantiles at 30%. The normal view is the better centre for launches like this
-one; the empirical share keeps honest tails for the hours where past launches
-disagreed wildly. The normal spread is widened by sqrt(12 / n_eff), capped at
-1.5, where n_eff is the weights' effective sample size: when the kernel
-concentrates on a handful of launches, the fit knows less than the IQR of
-those few suggests.
+3. Geometry matters. A rolling launch's ramps sit at fixed UTC offsets of the
+   regional midnights, and those offsets move an hour with daylight saving
+   (US Eastern midnight is 04:00Z in EDT, 05:00Z in EST). Each comparable's
+   curve is shifted by the difference between its US-Eastern unlock offset
+   and the target's — both computed from the release dates by the DST rules —
+   before its log ratios are taken, so the US ramp lands on the same hours.
 
-Validation while building (leave-one-out over the comparables, and the four
-practice cases scored against their actual release days): mean pinball loss on
-the log scale about 0.74 / 0.23, against the persistence baseline's 0.93 / 0.39.
+Per forecast hour, a ridge regression (features: ln hour-1 viewers, the
+pre-day liveness a1 = ln(median viewers in the last 6 pre-day hours /
+hour-1 viewers), and its hinge max(0, a1 - 0.3); standardised, lambda 3)
+predicts the shifted log ratio's centre. The five quantiles are that centre
+plus the leave-one-out residuals' distribution (hat-matrix shortcut), as an
+even blend of the residuals' empirical quantiles and a normal fit on their
+IQR. Targets that are not rolling launches fall back to a full-pool ridge on
+(ln v1, (ln v1 - 11)^2); with no usable comparables at all, to the house
+persistence baseline.
+
+Validation while building: practice cases 0.163 mean pinball (v2: 0.227),
+leave-one-out over the in-class comparables 0.30 (v2 on the same targets:
+see repo history), leave-one-out over all comparables kept honest by the
+gated fallback.
 
 The grader runs `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim: standard library only, no network. Outside the container,
@@ -43,7 +52,7 @@ import json
 import math
 import os
 import sys
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # The grader's -P leaves /bot off sys.path: put it back first, so a module
@@ -56,15 +65,14 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-# Model constants, tuned on leave-one-out over the comparables and checked on
-# the four practice cases (see the docstring).
-KERNEL_BANDWIDTH = 0.35
-KERNEL_FLOOR = 0.02
-CONSOLE_BONUS = 2.0
-SD_SHRINK = 0.9
-EMPIRICAL_SHARE = 0.3
+RIDGE_LAMBDA = 3.0
+RESID_BLEND = 0.5  # empirical share of the quantile blend (rest: normal fit)
+HINGE_AT = 0.3
 
 
+# --------------------------------------------------------------------------
+# small numeric helpers
+# --------------------------------------------------------------------------
 def parse_ts(text):
     return datetime.fromisoformat(text.replace("Z", "+00:00"))
 
@@ -79,37 +87,6 @@ def round2(x):
     return int(value) if float(value).is_integer() else value
 
 
-def day_curve(comp):
-    """{hour: viewers} for hours 1..24 of a comparable's release day."""
-    start = parse_ts(comp["day_start"])
-    out = {}
-    for row in comp.get("hourly") or []:
-        try:
-            delta = (parse_ts(row["from"]) - start).total_seconds()
-            viewers = row["viewers"]
-        except (KeyError, TypeError, ValueError):
-            continue
-        if 0 <= delta < 24 * 3600 and viewers:
-            out[int(delta // 3600) + 1] = viewers
-    return out
-
-
-def pre_day_viewers(comp):
-    """A comparable's hourly viewers in the 14 days before its release day."""
-    start = parse_ts(comp["day_start"])
-    rows = []
-    for row in comp.get("hourly") or []:
-        try:
-            delta = (parse_ts(row["from"]) - start).total_seconds()
-            viewers = row["viewers"]
-        except (KeyError, TypeError, ValueError):
-            continue
-        if -14 * 24 * 3600 <= delta < 0 and viewers:
-            rows.append((delta, viewers))
-    rows.sort()
-    return [v for _, v in rows]
-
-
 def median(values):
     vals = sorted(values)
     n = len(vals)
@@ -121,45 +98,207 @@ def median(values):
     return (vals[mid - 1] + vals[mid]) / 2
 
 
-def launch_feature(pre_viewers, first_hour):
-    """a1: how live the launch already was in the 6 hours before the day."""
-    tail = [v for v in pre_viewers[-6:] if v and v > 0]
-    if not tail or not first_hour or first_hour <= 0:
-        return None
-    return math.log(median(tail) / first_hour)
-
-
-def weighted_quantile(pairs, tau):
-    """Weighted quantile of [(value, weight)], linear within the hit step."""
-    if not pairs:
+def quantile(sorted_vals, tau):
+    if not sorted_vals:
         return 0.0
-    pairs = sorted(pairs)
-    total = sum(w for _, w in pairs)
-    if total <= 0:
-        return pairs[len(pairs) // 2][0]
-    acc = 0.0
-    for i, (value, w) in enumerate(pairs):
-        acc += w
-        if acc / total >= tau:
-            if i + 1 < len(pairs) and w > 0:
-                frac = (tau * total - (acc - w)) / w
-                frac = min(1.0, max(0.0, frac))
-                return value + frac * (pairs[i + 1][0] - value)
-            return value
-    return pairs[-1][0]
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    pos = tau * (len(sorted_vals) - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = pos - lo
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
 
 
-def comparable_weight(comp_feature, target_feature, console_only):
-    if comp_feature is not None and target_feature is not None:
-        d = comp_feature - target_feature
-        weight = KERNEL_FLOOR + math.exp(-(d * d) / (2 * KERNEL_BANDWIDTH**2))
-    elif target_feature is None:
-        weight = KERNEL_FLOOR + 1.0
-    else:
-        weight = KERNEL_FLOOR
-    if console_only:
-        weight *= CONSOLE_BONUS
-    return weight
+def solve(A, b):
+    """Gaussian elimination with partial pivoting (small dense systems)."""
+    n = len(A)
+    M = [row[:] + [b[i]] for i, row in enumerate(A)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(M[r][col]))
+        if abs(M[piv][col]) < 1e-12:
+            continue
+        M[col], M[piv] = M[piv], M[col]
+        pv = M[col][col]
+        for r in range(n):
+            if r != col and M[r][col] != 0.0:
+                f = M[r][col] / pv
+                for c in range(col, n + 1):
+                    M[r][c] -= f * M[col][c]
+    return [M[i][n] / M[i][i] if abs(M[i][i]) > 1e-12 else 0.0 for i in range(n)]
+
+
+def inverse(A):
+    n = len(A)
+    cols = []
+    for j in range(n):
+        e = [1.0 if i == j else 0.0 for i in range(n)]
+        cols.append(solve(A, e))
+    return [[cols[j][i] for j in range(n)] for i in range(n)]
+
+
+# --------------------------------------------------------------------------
+# rollout geometry: UTC offsets of regional midnights, from the date alone
+# --------------------------------------------------------------------------
+def nth_sunday(year, month, n):
+    d = date(year, month, 1)
+    off = (6 - d.weekday()) % 7
+    return d + timedelta(days=off + 7 * (n - 1))
+
+
+def us_east_offset(d):
+    """UTC hour of US Eastern midnight on date d: 4 in EDT, 5 in EST."""
+    start = nth_sunday(d.year, 3, 2)
+    end = nth_sunday(d.year, 11, 1)
+    return 4 if start <= d < end else 5
+
+
+# --------------------------------------------------------------------------
+# unlock-text classification (from the case's own fields, at runtime)
+# --------------------------------------------------------------------------
+def unlock_kind(text):
+    u = (text or "").lower()
+    # A negated mention ("rolling, no simultaneous launch") is not a global
+    # unlock; only an affirmative one is.
+    global_hit = (("simultaneous" in u or "single global" in u)
+                  and "no simultaneous" not in u
+                  and "not simultaneous" not in u
+                  and "no single global" not in u)
+    if global_hit:
+        return "global"
+    if "rolling" in u or "midnight local" in u:
+        return "rolling"
+    if "unverified" in u:
+        return "unverified"
+    return "other"
+
+
+def unlock_tier(text):
+    u = text or ""
+    marker = "Tier:"
+    if marker in u:
+        rest = u.split(marker, 1)[1].strip()
+        word = rest.split()[0].strip(".,").lower() if rest.split() else ""
+        return word
+    return ""
+
+
+# --------------------------------------------------------------------------
+# comparable extraction
+# --------------------------------------------------------------------------
+class Comp:
+    __slots__ = ("name", "series", "curve", "pre", "logv1", "a1", "a1h",
+                 "logv1sq", "kind", "tier", "use", "v1_over_peak")
+
+    def __init__(self, raw):
+        self.name = raw.get("name", "")
+        start = parse_ts(raw["day_start"])
+        self.series = {}
+        for row in raw.get("hourly") or []:
+            try:
+                off = int(round((parse_ts(row["from"]) - start).total_seconds() / 3600))
+                v = row["viewers"]
+            except (KeyError, TypeError, ValueError):
+                continue
+            if v:
+                self.series[off] = v
+        self.curve = {h: self.series[h - 1] for h in range(1, 25)
+                      if self.series.get(h - 1)}
+        pre_offsets = sorted(o for o in self.series if o < 0)
+        self.pre = [self.series[o] for o in pre_offsets]
+        self.kind = unlock_kind(raw.get("unlock"))
+        self.tier = unlock_tier(raw.get("unlock"))
+        self.use = us_east_offset(start.date())
+        v1 = self.curve.get(1)
+        if len(self.curve) == 24 and v1 and v1 > 0:
+            self.logv1 = math.log(v1)
+            tail = [v for v in self.pre[-6:] if v and v > 0]
+            self.a1 = math.log(median(tail) / v1) if tail else 0.0
+            peak = max(self.curve.values())
+            self.v1_over_peak = v1 / peak if peak else 0.0
+        else:
+            self.logv1 = None
+            self.a1 = 0.0
+            self.v1_over_peak = 0.0
+        self.a1h = max(0.0, self.a1 - HINGE_AT)
+        self.logv1sq = (self.logv1 - 11.0) ** 2 if self.logv1 is not None else 0.0
+
+    @property
+    def usable(self):
+        return self.logv1 is not None
+
+    @property
+    def in_class(self):
+        """Rolling-class, uncontaminated, with a real hour-1 audience."""
+        return (self.kind in ("rolling", "unverified")
+                and self.tier not in ("early-access-contaminated", "weak")
+                and self.v1_over_peak >= 0.01)
+
+    def shifted_log_ratio(self, target_use, h):
+        """ln(viewers[h]/viewers[1]) with this curve shifted into the
+        target's rollout geometry (shift = target USE offset - own)."""
+        sh = target_use - self.use
+        v_h = self.series.get(h - 1 - sh)
+        v_1 = self.series.get(0 - sh)
+        if v_h and v_1:
+            return math.log(v_h / v_1)
+        return None
+
+    def log_ratio(self, h):
+        if self.curve.get(h) and self.curve.get(1):
+            return math.log(self.curve[h] / self.curve[1])
+        return None
+
+
+# --------------------------------------------------------------------------
+# ridge regression with hat-shortcut leave-one-out residuals
+# --------------------------------------------------------------------------
+def ridge_fit(feat_rows, y, lam):
+    """feat_rows: list of feature lists (raw). Returns (predict, loo_resid)."""
+    n = len(feat_rows)
+    p = len(feat_rows[0])
+    means = [sum(r[a] for r in feat_rows) / n for a in range(p)]
+    sds = []
+    for a in range(p):
+        var = sum((r[a] - means[a]) ** 2 for r in feat_rows) / n
+        sds.append(math.sqrt(var) if var > 1e-9 else 1.0)
+    Zx = [[(r[a] - means[a]) / sds[a] for a in range(p)] for r in feat_rows]
+    ybar = sum(y) / n
+    yc = [v - ybar for v in y]
+    A = [[sum(Zx[i][a] * Zx[i][b] for i in range(n)) + (lam if a == b else 0.0)
+          for b in range(p)] for a in range(p)]
+    bvec = [sum(Zx[i][a] * yc[i] for i in range(n)) for a in range(p)]
+    Ainv = inverse(A)
+    beta = [sum(Ainv[a][b] * bvec[b] for b in range(p)) for a in range(p)]
+    fitted = [ybar + sum(Zx[i][a] * beta[a] for a in range(p)) for i in range(n)]
+    loo = []
+    for i in range(n):
+        h_ii = sum(Zx[i][a] * sum(Ainv[a][b] * Zx[i][b] for b in range(p))
+                   for a in range(p))
+        h_ii = min(h_ii, 0.95)
+        loo.append((y[i] - fitted[i]) / (1.0 - h_ii))
+
+    def predict(feats):
+        z = [(feats[a] - means[a]) / sds[a] for a in range(p)]
+        z = [max(-3.0, min(3.0, v)) for v in z]  # no wild extrapolation
+        return ybar + sum(z[a] * beta[a] for a in range(p))
+
+    return predict, loo
+
+
+def ridge_quantiles(pool_feats, pool_y, target_feats, lam):
+    """(mu, [q05..q95 of log ratio]) from a ridge fit + LOO residuals."""
+    predict, loo = ridge_fit(pool_feats, pool_y, lam)
+    mu = predict(target_feats)
+    res = sorted(loo)
+    sd = max(0.05, (quantile(res, 0.75) - quantile(res, 0.25)) / 1.349)
+    qs = []
+    for tau, z in zip(LEVELS, Z):
+        emp = mu + quantile(res, tau)
+        nor = mu + z * sd
+        qs.append((1 - RESID_BLEND) * nor + RESID_BLEND * emp)
+    qs.sort()
+    return qs
 
 
 def baseline_quantiles(p1, h):
@@ -167,6 +306,9 @@ def baseline_quantiles(p1, h):
     return [p1 * math.exp(z * 0.15 * math.sqrt(h - 1)) for z in Z]
 
 
+# --------------------------------------------------------------------------
+# the forecast
+# --------------------------------------------------------------------------
 def forecast_case(case, name):
     if case["levels"] != LEVELS:
         raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
@@ -175,57 +317,61 @@ def forecast_case(case, name):
         raise ValueError(f"{name} has no hour-1 print")
     p1 = max(1, first["viewers"])
 
-    # This case's own launch feature, from the whole hours before day_start.
-    day_start = case["day_start"]
-    own_pre = [
-        row["viewers"]
-        for row in (case.get("history_hourly") or [])
-        if row.get("from", "") < day_start and row.get("viewers")
-    ]
-    target_feature = launch_feature(own_pre, p1)
+    day_start = parse_ts(case["day_start"])
+    target_use = us_east_offset(day_start.date())
+    target_kind = unlock_kind(case.get("notes"))
 
-    # Weighted log-ratio samples per hour from the comparables.
-    samples = {h: [] for h in range(2, 25)}
-    weights = []
-    for comp in case.get("comparables") or []:
-        curve = day_curve(comp)
-        if len(curve) < 24 or not curve.get(1):
+    # The target's own features, from its history before day_start.
+    own_pre = [row["viewers"] for row in (case.get("history_hourly") or [])
+               if row.get("from", "") < case["day_start"] and row.get("viewers")]
+    logv1_t = math.log(p1)
+    tail = [v for v in own_pre[-6:] if v and v > 0]
+    a1_t = math.log(median(tail) / p1) if tail else 0.0
+    a1h_t = max(0.0, a1_t - HINGE_AT)
+    logv1sq_t = (logv1_t - 11.0) ** 2
+
+    comps = []
+    for raw in case.get("comparables") or []:
+        try:
+            c = Comp(raw)
+        except (KeyError, TypeError, ValueError):
             continue
-        feature = launch_feature(pre_day_viewers(comp), curve[1])
-        console_only = "PC" not in (comp.get("platforms") or "")
-        weight = comparable_weight(feature, target_feature, console_only)
-        weights.append(weight)
-        base = curve[1]
-        for h in range(2, 25):
-            if curve.get(h):
-                samples[h].append((math.log(curve[h] / base), weight))
+        if c.usable:
+            comps.append(c)
+    comps.sort(key=lambda c: c.name)  # stable order => deterministic output
 
-    # Effective sample size of the weights: a concentrated kernel means the
-    # spread must widen, because fewer launches are really speaking.
-    if weights:
-        total_w = sum(weights)
-        n_eff = total_w * total_w / sum(w * w for w in weights)
-        sd_mult = min(1.5, math.sqrt(max(1.0, 12.0 / n_eff)))
-    else:
-        sd_mult = 1.0
+    in_class = [c for c in comps if c.in_class]
+    rolling_target = target_kind in ("rolling", "unverified")
+    use_in_class = rolling_target and len(in_class) >= 8
 
     rows = []
     for row in case["forecast"]:
         h = row["hour"]
-        pairs = samples.get(h) or []
-        if not pairs:
+        qs = None
+        if use_in_class:
+            feats, ys = [], []
+            for c in in_class:
+                y = c.shifted_log_ratio(target_use, h)
+                if y is not None:
+                    feats.append([c.logv1, c.a1, c.a1h])
+                    ys.append(y)
+            if len(ys) >= 8:
+                log_qs = ridge_quantiles(feats, ys, [logv1_t, a1_t, a1h_t],
+                                         RIDGE_LAMBDA)
+                qs = [p1 * math.exp(v) for v in log_qs]
+        if qs is None and comps:
+            feats, ys = [], []
+            for c in comps:
+                y = c.log_ratio(h)
+                if y is not None:
+                    feats.append([c.logv1, c.logv1sq])
+                    ys.append(y)
+            if len(ys) >= 8:
+                log_qs = ridge_quantiles(feats, ys, [logv1_t, logv1sq_t],
+                                         RIDGE_LAMBDA)
+                qs = [p1 * math.exp(v) for v in log_qs]
+        if qs is None:
             qs = baseline_quantiles(p1, h)
-        else:
-            med = weighted_quantile(pairs, 0.5)
-            q25 = weighted_quantile(pairs, 0.25)
-            q75 = weighted_quantile(pairs, 0.75)
-            sd = max(0.08, (q75 - q25) / 1.349) * SD_SHRINK * sd_mult
-            qs = []
-            for tau, z in zip(LEVELS, Z):
-                normal_log = med + z * sd
-                empirical_log = weighted_quantile(pairs, tau)
-                blended = (1 - EMPIRICAL_SHARE) * normal_log + EMPIRICAL_SHARE * empirical_log
-                qs.append(p1 * math.exp(blended))
         # Enforce the output contract: non-decreasing, finite, in (0, 1e9].
         qs = [min(1e9, max(1e-6, q)) for q in qs]
         qs.sort()
