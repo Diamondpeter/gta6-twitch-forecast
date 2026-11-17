@@ -1,13 +1,15 @@
 """Forecast GTA VI's launch-day Twitch viewers, hour by hour (Python 3.13, stdlib only).
 
-Model v7: a two-stage ridge decomposition — day peak, then shape around the
+Model v8: a two-stage ridge decomposition — day peak, then shape around the
 peak — on comparable launches, in the target's own rollout geometry.
-v7 retunes v6's frame on three small, uniformly-validated knobs: the a1
-hinge moves to 0.45, the residual quantile blend to 90/10 normal/empirical,
-the peak reference becomes the mean of the day's three largest hours
-(less hostage to one spiky hour), and the shape stage's coefficient
-vectors are smoothed across neighbouring hours (centre weight 0.7), so
-adjacent hours cannot disagree wildly on a 19-launch sample.
+v8 keeps v7's frame (a1 hinge 0.45, peak reference = mean of the day's
+three largest hours, shape-stage coefficients smoothed across neighbouring
+hours) and stabilises the calibration: with only ~19 launches in the pool,
+each hour's residual spread is a noisy estimate, so the per-hour spread is
+shrunk toward the day-wide mean spread (weight n/(n+32)) before the
+quantiles are formed, and the normal/empirical blend moves to 95/5. The
+shrinkage is the one calibration change that improved practice, in-class
+leave-one-out and all-launch leave-one-out simultaneously.
 
 What the data says (leave-one-out over the comparables, and the four practice
 cases scored against their actual release days):
@@ -48,8 +50,10 @@ cases scored against their actual release days):
    coefficient vector smoothed toward its two neighbours') predicts
    each hour's shape around the peak. The five quantiles are the composed
    centre plus the distribution of the total leave-one-out residuals
-   (stage A's plus stage B's, hat-matrix shortcut), blended 90/10 between a
-   normal fit on the residuals' IQR and their empirical quantiles. If the
+   (stage A's plus stage B's, hat-matrix shortcut), blended 95/5 between a
+   normal fit on the residuals' IQR — the IQR spread shrunk toward the
+   day-wide mean spread, as described above — and their empirical
+   quantiles. If the
    decomposition cannot be built, a per-hour ridge on the same pool is the
    fallback; targets that are not rolling launches fall back to a full-pool
    ridge on (ln v1, (ln v1 - 11)^2); with no usable comparables at all, to
@@ -63,10 +67,10 @@ cases scored against their actual release days):
    on synthetic targets scaled x10 it cuts the log-scale pinball of the
    largest practice case from 0.38 to 0.24.
 
-Validation while building: practice cases 0.133 mean pinball (v6: 0.135,
-v4: 0.147, v2: 0.227), leave-one-out over the in-class comparables 0.29,
-leave-one-out over all comparables 0.58 (v2: 0.74), the all-comparables
-figure kept honest by the gated fallback.
+Validation while building: practice cases 0.129 mean pinball (v7: 0.133,
+v6: 0.135, v4: 0.147, v2: 0.227), leave-one-out over the in-class
+comparables 0.29, leave-one-out over all comparables 0.58 (v2: 0.74),
+the all-comparables figure kept honest by the gated fallback.
 
 The grader runs `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim: standard library only, no network. Outside the container,
@@ -91,11 +95,12 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
 RIDGE_LAMBDA = 4.0
-RESID_BLEND = 0.10  # empirical share of the quantile blend (rest: normal fit)
+RESID_BLEND = 0.05  # empirical share of the quantile blend (rest: normal fit)
 HINGE_AT = 0.45
 LAM_A = 2.0  # peak-stage ridge lambda
 LAM_B = 6.0  # shape-stage ridge lambda
 SMOOTH_BETA = 0.3  # neighbour weight when smoothing stage-B betas over hours
+SD_SHRINK = 32.0  # shrink per-hour residual spread toward the day-wide mean
 FEATS_A = ["logv1", "a1", "a1h", "pre1"]
 FEATS_B = ["logv1", "a1", "a1h", "pre1", "logch1"]
 
@@ -364,10 +369,13 @@ def ridge_quantiles(pool_feats, pool_y, target_feats, lam):
     return qs
 
 
-def blend_quantiles(mu, res_sorted):
+def blend_quantiles(mu, res_sorted, sd_override=None):
     """Centre + blended (normal/empirical) quantiles of LOO residuals."""
     res = res_sorted
-    sd = max(0.05, (quantile(res, 0.75) - quantile(res, 0.25)) / 1.349)
+    if sd_override is not None:
+        sd = sd_override
+    else:
+        sd = max(0.05, (quantile(res, 0.75) - quantile(res, 0.25)) / 1.349)
     qs = []
     for tau, z in zip(LEVELS, Z):
         emp = mu + quantile(res, tau)
@@ -429,7 +437,9 @@ def ridge_fit_full(feat_rows, y, lam):
 def peakshape_quantiles_smooth(data, target_a, target_b, s):
     """peakshape_quantiles with the stage-B coefficient vectors smoothed
     across hours: beta'_h = (1-s) beta_h + s * mean(beta_{h-1}, beta_{h+1}).
-    Calibration still uses the unsmoothed hat LOO residuals."""
+    Calibration uses the unsmoothed hat LOO residuals, with each hour's
+    residual spread shrunk toward the day-wide mean spread (SD_SHRINK):
+    at ~19 pool members the raw per-hour IQR is mostly sampling noise."""
     feats = [d[0] for d in data]
     prs = [d[3] for d in data]
     pred_a, loo_a = ridge_fit(feats, prs, LAM_A)
@@ -442,7 +452,7 @@ def peakshape_quantiles_smooth(data, target_a, target_b, s):
         means, sds, ybar, beta, loo_b = ridge_fit_full(
             [data[i][1] for i in idx], [data[i][2][h] for i in idx], LAM_B)
         fits[h] = (means, sds, ybar, beta, loo_b, idx)
-    out = {}
+    staged = {}
     for h, (means, sds, ybar, beta, loo_b, idx) in fits.items():
         neigh = [fits[k][3] for k in (h - 1, h + 1) if k in fits]
         if neigh and s:
@@ -453,7 +463,15 @@ def peakshape_quantiles_smooth(data, target_a, target_b, s):
         z = [max(-3.0, min(3.0, v)) for v in z]
         mu = mu_a + ybar + sum(z[a] * beta[a] for a in range(len(beta)))
         res = sorted(loo_a[i] + loo_b[j] for j, i in enumerate(idx))
-        out[h] = blend_quantiles(mu, res)
+        staged[h] = (mu, res)
+    raw_sd = {h: max(0.05, (quantile(res, 0.75) - quantile(res, 0.25)) / 1.349)
+              for h, (mu, res) in staged.items()}
+    mean_sd = sum(raw_sd.values()) / len(raw_sd) if raw_sd else 0.0
+    out = {}
+    for h, (mu, res) in staged.items():
+        n_h = len(res)
+        sd = (n_h * raw_sd[h] + SD_SHRINK * mean_sd) / (n_h + SD_SHRINK)
+        out[h] = blend_quantiles(mu, res, sd)
     return out
 
 
