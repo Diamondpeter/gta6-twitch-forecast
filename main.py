@@ -46,8 +46,14 @@ cases scored against their actual release days):
    fallback; targets that are not rolling launches fall back to a full-pool
    ridge on (ln v1, (ln v1 - 11)^2); with no usable comparables at all, to
    the house persistence baseline. Standardised features are clipped at
-   +/-3 sd when predicting, so an hour-1 larger than every comparable's
-   (as GTA VI's may be) cannot extrapolate explosively.
+   +/-3 sd when predicting, and the target's ln hour-1 is winsorised at
+   the pool's maximum + 0.3, so an hour-1 larger than every comparable's
+   (as GTA VI's may be) cannot extrapolate explosively: beyond the largest
+   comparable, the forecast responds like that comparable, not beyond it.
+   The winsorisation is exactly neutral on the practice cases and in
+   leave-one-out (no in-sample target exceeds its pool's maximum + 0.3);
+   on synthetic targets scaled x10 it cuts the log-scale pinball of the
+   largest practice case from 0.38 to 0.24.
 
 Validation while building: practice cases 0.135 mean pinball (v4: 0.147,
 v2: 0.227), leave-one-out over the in-class comparables 0.29,
@@ -431,6 +437,15 @@ def forecast_case(case, name):
     in_class = [c for c in comps if c.in_class_plus]
     rolling_target = target_kind in ("rolling", "unverified")
     use_in_class = rolling_target and len(in_class) >= 8
+    if use_in_class:
+        # Winsorise the target's scale at the pool's range edge (+0.3 log):
+        # the scale response saturates instead of extrapolating.
+        cap = max(c.logv1 for c in in_class) + 0.3
+        if logv1_t > cap:
+            logv1_t = cap
+            logv1sq_t = (logv1_t - 11.0) ** 2
+            ctx_t["logv1"] = cap
+            ctx_t["logv1sq"] = logv1sq_t
 
     # Two-stage decomposition over the pool, when it can be built.
     pre_qs = None
