@@ -1,7 +1,7 @@
 """Forecast GTA VI's launch-day Twitch viewers, hour by hour (Python 3.13, stdlib only).
 
-Model v4: a per-hour ridge regression on comparable launches, in the target's
-own rollout geometry.
+Model v5: a two-stage ridge decomposition — day peak, then shape around the
+peak — on comparable launches, in the target's own rollout geometry.
 
 What the data says (leave-one-out over the comparables, and the four practice
 cases scored against their actual release days):
@@ -16,33 +16,42 @@ cases scored against their actual release days):
 2. Company matters. The pool mixes rolling midnight-local launches with
    single-global-unlock and early-access-contaminated ones whose hour 1 is a
    pre-unlock artefact (a few hundred viewers, ratios in the thousands of
-   percent). For a rolling target, only the rolling/unverified, uncontaminated
-   comparables with a real hour-1 audience (>= 1% of their own day peak) are
-   used: the "in-class" pool, identified at runtime from each comparable's
-   unlock text (its Tier marker and wording) and its own curve.
+   percent). For a rolling target, the pool is the rolling/unverified,
+   uncontaminated comparables with a real hour-1 audience (>= 1% of their
+   own day peak), plus any clean-tier launch whose hour 1 already held a
+   real audience (>= 30% of its own peak) even under a global unlock —
+   identified at runtime from each comparable's unlock text (its Tier
+   marker and wording) and its own curve.
 
 3. Geometry matters. A rolling launch's ramps sit at fixed UTC offsets of the
    regional midnights, and those offsets move an hour with daylight saving
    (US Eastern midnight is 04:00Z in EDT, 05:00Z in EST). Each comparable's
    curve is shifted by the difference between its US-Eastern unlock offset
    and the target's — both computed from the release dates by the DST rules —
-   before its log ratios are taken, so the US ramp lands on the same hours.
+   before its ratios are taken, so the US ramp lands on the same hours.
 
-Per forecast hour, a ridge regression (features: ln hour-1 viewers, the
-pre-day liveness a1 = ln(median viewers in the last 6 pre-day hours /
-hour-1 viewers), its hinge max(0, a1 - 0.3), and pre1 = ln(viewers in the
-last pre-day hour / hour-1 viewers) — the pre-day's closing level, which
-tracks how deep the coming midday trough cuts; standardised, lambda 4)
-predicts the shifted log ratio's centre. The five quantiles are that centre
-plus the leave-one-out residuals' distribution (hat-matrix shortcut),
-blended 70/30 between a normal fit on the residuals' IQR and their
-empirical quantiles. Targets that are not rolling launches fall back to a
-full-pool ridge on (ln v1, (ln v1 - 11)^2); with no usable comparables at
-all, to the house persistence baseline.
+4. Peak first, then shape. The forecast decomposes the log ratio as
+   ln(peak / hour-1) + ln(viewers[h] / peak) over the shifted day window.
+   A ridge (features: ln hour-1 viewers, the pre-day liveness a1 = ln(median
+   viewers in the last 6 pre-day hours / hour-1 viewers), its hinge
+   max(0, a1 - 0.3), and pre1 = ln(viewers in the last pre-day hour /
+   hour-1 viewers) — the pre-day's closing level; lambda 2) predicts the
+   peak term; a second ridge (the same features plus ln hour-1 channels,
+   which tracks how broad the launch's streamer base is; lambda 6) predicts
+   each hour's shape around the peak. The five quantiles are the composed
+   centre plus the distribution of the total leave-one-out residuals
+   (stage A's plus stage B's, hat-matrix shortcut), blended 85/15 between a
+   normal fit on the residuals' IQR and their empirical quantiles. If the
+   decomposition cannot be built, a per-hour ridge on the same pool is the
+   fallback; targets that are not rolling launches fall back to a full-pool
+   ridge on (ln v1, (ln v1 - 11)^2); with no usable comparables at all, to
+   the house persistence baseline. Standardised features are clipped at
+   +/-3 sd when predicting, so an hour-1 larger than every comparable's
+   (as GTA VI's may be) cannot extrapolate explosively.
 
-Validation while building: practice cases 0.147 mean pinball (v2: 0.227,
-v3: 0.162), leave-one-out over the in-class comparables 0.30,
-leave-one-out over all comparables 0.61 (v2: 0.74), the all-comparables
+Validation while building: practice cases 0.135 mean pinball (v4: 0.147,
+v2: 0.227), leave-one-out over the in-class comparables 0.29,
+leave-one-out over all comparables 0.58 (v2: 0.74), the all-comparables
 figure kept honest by the gated fallback.
 
 The grader runs `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
@@ -68,8 +77,28 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
 RIDGE_LAMBDA = 4.0
-RESID_BLEND = 0.3  # empirical share of the quantile blend (rest: normal fit)
+RESID_BLEND = 0.15  # empirical share of the quantile blend (rest: normal fit)
 HINGE_AT = 0.3
+LAM_A = 2.0  # peak-stage ridge lambda
+LAM_B = 6.0  # shape-stage ridge lambda
+FEATS_A = ["logv1", "a1", "a1h", "pre1"]
+FEATS_B = ["logv1", "a1", "a1h", "pre1", "logch1"]
+
+
+def comp_feat(c, name):
+    if name == "logv1":
+        return c.logv1
+    if name == "a1":
+        return c.a1
+    if name == "a1h":
+        return c.a1h
+    if name == "pre1":
+        return c.pre1
+    if name == "logv1sq":
+        return c.logv1sq
+    if name == "logch1":
+        return c.logch1
+    raise KeyError(name)
 
 
 # --------------------------------------------------------------------------
@@ -190,12 +219,14 @@ def unlock_tier(text):
 # --------------------------------------------------------------------------
 class Comp:
     __slots__ = ("name", "series", "curve", "pre", "logv1", "a1", "a1h",
-                 "pre1", "logv1sq", "kind", "tier", "use", "v1_over_peak")
+                 "pre1", "logv1sq", "kind", "tier", "use", "v1_over_peak",
+                 "logch1", "_ch")
 
     def __init__(self, raw):
         self.name = raw.get("name", "")
         start = parse_ts(raw["day_start"])
         self.series = {}
+        self._ch = {}
         for row in raw.get("hourly") or []:
             try:
                 off = int(round((parse_ts(row["from"]) - start).total_seconds() / 3600))
@@ -204,6 +235,9 @@ class Comp:
                 continue
             if v:
                 self.series[off] = v
+                ch = row.get("channels")
+                if ch:
+                    self._ch[off] = ch
         self.curve = {h: self.series[h - 1] for h in range(1, 25)
                       if self.series.get(h - 1)}
         pre_offsets = sorted(o for o in self.series if o < 0)
@@ -219,11 +253,14 @@ class Comp:
             self.pre1 = math.log(self.pre[-1] / v1) if self.pre else 0.0
             peak = max(self.curve.values())
             self.v1_over_peak = v1 / peak if peak else 0.0
+            ch1 = self._ch.get(0)
+            self.logch1 = math.log(ch1) if ch1 else None
         else:
             self.logv1 = None
             self.a1 = 0.0
             self.pre1 = 0.0
             self.v1_over_peak = 0.0
+            self.logch1 = None
         self.a1h = max(0.0, self.a1 - HINGE_AT)
         self.logv1sq = (self.logv1 - 11.0) ** 2 if self.logv1 is not None else 0.0
 
@@ -237,6 +274,13 @@ class Comp:
         return (self.kind in ("rolling", "unverified")
                 and self.tier not in ("early-access-contaminated", "weak")
                 and self.v1_over_peak >= 0.01)
+
+    @property
+    def in_class_plus(self):
+        """in_class, plus clean-tier launches whose hour 1 was already a
+        real audience even under a global/PC unlock (v1 >= 30% of peak)."""
+        return self.in_class or (self.tier == "comparable"
+                                 and self.v1_over_peak >= 0.3)
 
     def shifted_log_ratio(self, target_use, h):
         """ln(viewers[h]/viewers[1]) with this curve shifted into the
@@ -305,6 +349,41 @@ def ridge_quantiles(pool_feats, pool_y, target_feats, lam):
     return qs
 
 
+def blend_quantiles(mu, res_sorted):
+    """Centre + blended (normal/empirical) quantiles of LOO residuals."""
+    res = res_sorted
+    sd = max(0.05, (quantile(res, 0.75) - quantile(res, 0.25)) / 1.349)
+    qs = []
+    for tau, z in zip(LEVELS, Z):
+        emp = mu + quantile(res, tau)
+        nor = mu + z * sd
+        qs.append((1 - RESID_BLEND) * nor + RESID_BLEND * emp)
+    qs.sort()
+    return qs
+
+
+def peakshape_quantiles(data, target_a, target_b):
+    """data: list of (feats_a, feats_b, {h: log(v_h/peak)}, log(peak/v_1)).
+    Returns {h: [log-ratio quantiles]} composing the peak stage (LAM_A) and
+    the per-hour shape stage (LAM_B); the total LOO residual per comp is
+    stage A's plus stage B's at that hour."""
+    feats = [d[0] for d in data]
+    prs = [d[3] for d in data]
+    pred_a, loo_a = ridge_fit(feats, prs, LAM_A)
+    mu_a = pred_a(target_a)
+    out = {}
+    for h in range(2, 25):
+        idx = [i for i, d in enumerate(data) if h in d[2]]
+        if len(idx) < 8:
+            continue
+        pred_b, loo_b = ridge_fit([data[i][1] for i in idx],
+                                  [data[i][2][h] for i in idx], LAM_B)
+        mu = mu_a + pred_b(target_b)
+        res = sorted(loo_a[i] + loo_b[j] for j, i in enumerate(idx))
+        out[h] = blend_quantiles(mu, res)
+    return out
+
+
 def baseline_quantiles(p1, h):
     """The house persistence forecast, used when no comparable is usable."""
     return [p1 * math.exp(z * 0.15 * math.sqrt(h - 1)) for z in Z]
@@ -334,6 +413,10 @@ def forecast_case(case, name):
     a1h_t = max(0.0, a1_t - HINGE_AT)
     pre1_t = math.log(own_pre[-1] / p1) if own_pre else 0.0
     logv1sq_t = (logv1_t - 11.0) ** 2
+    ch1_t = first.get("channels")
+    logch1_t = math.log(ch1_t) if ch1_t else None
+    ctx_t = {"logv1": logv1_t, "a1": a1_t, "a1h": a1h_t, "pre1": pre1_t,
+             "logv1sq": logv1sq_t, "logch1": logch1_t}
 
     comps = []
     for raw in case.get("comparables") or []:
@@ -345,15 +428,51 @@ def forecast_case(case, name):
             comps.append(c)
     comps.sort(key=lambda c: c.name)  # stable order => deterministic output
 
-    in_class = [c for c in comps if c.in_class]
+    in_class = [c for c in comps if c.in_class_plus]
     rolling_target = target_kind in ("rolling", "unverified")
     use_in_class = rolling_target and len(in_class) >= 8
+
+    # Two-stage decomposition over the pool, when it can be built.
+    pre_qs = None
+    if use_in_class:
+        def stage_feats(names):
+            out = []
+            for f in names:
+                if ctx_t.get(f) is None:
+                    continue
+                if all(comp_feat(c, f) is not None for c in in_class):
+                    out.append(f)
+            return out
+
+        fa = stage_feats(FEATS_A)
+        fb = stage_feats(FEATS_B)
+        data = []
+        if fa and fb:
+            for c in in_class:
+                sh = target_use - c.use
+                vals = {}
+                for h in range(1, 25):
+                    v = c.series.get(h - 1 - sh)
+                    if v:
+                        vals[h] = v
+                if len(vals) >= 20 and vals.get(1):
+                    peak = max(vals.values())
+                    pr = math.log(peak / vals[1])
+                    ys = {h: math.log(vals[h] / peak)
+                          for h in range(2, 25) if vals.get(h)}
+                    data.append(([comp_feat(c, f) for f in fa],
+                                 [comp_feat(c, f) for f in fb], ys, pr))
+        if len(data) >= 8:
+            pre_qs = peakshape_quantiles(
+                data, [ctx_t[f] for f in fa], [ctx_t[f] for f in fb])
 
     rows = []
     for row in case["forecast"]:
         h = row["hour"]
         qs = None
-        if use_in_class:
+        if pre_qs is not None and h in pre_qs:
+            qs = [p1 * math.exp(v) for v in pre_qs[h]]
+        elif use_in_class:
             feats, ys = [], []
             for c in in_class:
                 y = c.shifted_log_ratio(target_use, h)
