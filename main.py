@@ -1,7 +1,13 @@
 """Forecast GTA VI's launch-day Twitch viewers, hour by hour (Python 3.13, stdlib only).
 
-Model v5: a two-stage ridge decomposition — day peak, then shape around the
+Model v7: a two-stage ridge decomposition — day peak, then shape around the
 peak — on comparable launches, in the target's own rollout geometry.
+v7 retunes v6's frame on three small, uniformly-validated knobs: the a1
+hinge moves to 0.45, the residual quantile blend to 90/10 normal/empirical,
+the peak reference becomes the mean of the day's three largest hours
+(less hostage to one spiky hour), and the shape stage's coefficient
+vectors are smoothed across neighbouring hours (centre weight 0.7), so
+adjacent hours cannot disagree wildly on a 19-launch sample.
 
 What the data says (leave-one-out over the comparables, and the four practice
 cases scored against their actual release days):
@@ -31,16 +37,18 @@ cases scored against their actual release days):
    before its ratios are taken, so the US ramp lands on the same hours.
 
 4. Peak first, then shape. The forecast decomposes the log ratio as
-   ln(peak / hour-1) + ln(viewers[h] / peak) over the shifted day window.
+   ln(peak / hour-1) + ln(viewers[h] / peak) over the shifted day window,
+   with "peak" the mean of the window's three largest hours.
    A ridge (features: ln hour-1 viewers, the pre-day liveness a1 = ln(median
    viewers in the last 6 pre-day hours / hour-1 viewers), its hinge
-   max(0, a1 - 0.3), and pre1 = ln(viewers in the last pre-day hour /
+   max(0, a1 - 0.45), and pre1 = ln(viewers in the last pre-day hour /
    hour-1 viewers) — the pre-day's closing level; lambda 2) predicts the
    peak term; a second ridge (the same features plus ln hour-1 channels,
-   which tracks how broad the launch's streamer base is; lambda 6) predicts
+   which tracks how broad the launch's streamer base is; lambda 6, its
+   coefficient vector smoothed toward its two neighbours') predicts
    each hour's shape around the peak. The five quantiles are the composed
    centre plus the distribution of the total leave-one-out residuals
-   (stage A's plus stage B's, hat-matrix shortcut), blended 85/15 between a
+   (stage A's plus stage B's, hat-matrix shortcut), blended 90/10 between a
    normal fit on the residuals' IQR and their empirical quantiles. If the
    decomposition cannot be built, a per-hour ridge on the same pool is the
    fallback; targets that are not rolling launches fall back to a full-pool
@@ -55,8 +63,8 @@ cases scored against their actual release days):
    on synthetic targets scaled x10 it cuts the log-scale pinball of the
    largest practice case from 0.38 to 0.24.
 
-Validation while building: practice cases 0.135 mean pinball (v4: 0.147,
-v2: 0.227), leave-one-out over the in-class comparables 0.29,
+Validation while building: practice cases 0.133 mean pinball (v6: 0.135,
+v4: 0.147, v2: 0.227), leave-one-out over the in-class comparables 0.29,
 leave-one-out over all comparables 0.58 (v2: 0.74), the all-comparables
 figure kept honest by the gated fallback.
 
@@ -83,10 +91,11 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
 RIDGE_LAMBDA = 4.0
-RESID_BLEND = 0.15  # empirical share of the quantile blend (rest: normal fit)
-HINGE_AT = 0.3
+RESID_BLEND = 0.10  # empirical share of the quantile blend (rest: normal fit)
+HINGE_AT = 0.45
 LAM_A = 2.0  # peak-stage ridge lambda
 LAM_B = 6.0  # shape-stage ridge lambda
+SMOOTH_BETA = 0.3  # neighbour weight when smoothing stage-B betas over hours
 FEATS_A = ["logv1", "a1", "a1h", "pre1"]
 FEATS_B = ["logv1", "a1", "a1h", "pre1", "logch1"]
 
@@ -390,6 +399,64 @@ def peakshape_quantiles(data, target_a, target_b):
     return out
 
 
+def ridge_fit_full(feat_rows, y, lam):
+    """ridge_fit that also exposes (means, sds, ybar, beta, loo)."""
+    n = len(feat_rows)
+    p = len(feat_rows[0])
+    means = [sum(r[a] for r in feat_rows) / n for a in range(p)]
+    sds = []
+    for a in range(p):
+        var = sum((r[a] - means[a]) ** 2 for r in feat_rows) / n
+        sds.append(math.sqrt(var) if var > 1e-9 else 1.0)
+    Zx = [[(r[a] - means[a]) / sds[a] for a in range(p)] for r in feat_rows]
+    ybar = sum(y) / n
+    yc = [v - ybar for v in y]
+    A = [[sum(Zx[i][a] * Zx[i][b] for i in range(n)) + (lam if a == b else 0.0)
+          for b in range(p)] for a in range(p)]
+    bvec = [sum(Zx[i][a] * yc[i] for i in range(n)) for a in range(p)]
+    Ainv = inverse(A)
+    beta = [sum(Ainv[a][b] * bvec[b] for b in range(p)) for a in range(p)]
+    fitted = [ybar + sum(Zx[i][a] * beta[a] for a in range(p)) for i in range(n)]
+    loo = []
+    for i in range(n):
+        h_ii = sum(Zx[i][a] * sum(Ainv[a][b] * Zx[i][b] for b in range(p))
+                   for a in range(p))
+        h_ii = min(h_ii, 0.95)
+        loo.append((y[i] - fitted[i]) / (1.0 - h_ii))
+    return means, sds, ybar, beta, loo
+
+
+def peakshape_quantiles_smooth(data, target_a, target_b, s):
+    """peakshape_quantiles with the stage-B coefficient vectors smoothed
+    across hours: beta'_h = (1-s) beta_h + s * mean(beta_{h-1}, beta_{h+1}).
+    Calibration still uses the unsmoothed hat LOO residuals."""
+    feats = [d[0] for d in data]
+    prs = [d[3] for d in data]
+    pred_a, loo_a = ridge_fit(feats, prs, LAM_A)
+    mu_a = pred_a(target_a)
+    fits = {}
+    for h in range(2, 25):
+        idx = [i for i, d in enumerate(data) if h in d[2]]
+        if len(idx) < 8:
+            continue
+        means, sds, ybar, beta, loo_b = ridge_fit_full(
+            [data[i][1] for i in idx], [data[i][2][h] for i in idx], LAM_B)
+        fits[h] = (means, sds, ybar, beta, loo_b, idx)
+    out = {}
+    for h, (means, sds, ybar, beta, loo_b, idx) in fits.items():
+        neigh = [fits[k][3] for k in (h - 1, h + 1) if k in fits]
+        if neigh and s:
+            nb = [sum(b[a] for b in neigh) / len(neigh)
+                  for a in range(len(beta))]
+            beta = [(1 - s) * beta[a] + s * nb[a] for a in range(len(beta))]
+        z = [(target_b[a] - means[a]) / sds[a] for a in range(len(beta))]
+        z = [max(-3.0, min(3.0, v)) for v in z]
+        mu = mu_a + ybar + sum(z[a] * beta[a] for a in range(len(beta)))
+        res = sorted(loo_a[i] + loo_b[j] for j, i in enumerate(idx))
+        out[h] = blend_quantiles(mu, res)
+    return out
+
+
 def baseline_quantiles(p1, h):
     """The house persistence forecast, used when no comparable is usable."""
     return [p1 * math.exp(z * 0.15 * math.sqrt(h - 1)) for z in Z]
@@ -471,15 +538,17 @@ def forecast_case(case, name):
                     if v:
                         vals[h] = v
                 if len(vals) >= 20 and vals.get(1):
-                    peak = max(vals.values())
+                    top = sorted(vals.values(), reverse=True)[:3]
+                    peak = sum(top) / len(top)
                     pr = math.log(peak / vals[1])
                     ys = {h: math.log(vals[h] / peak)
                           for h in range(2, 25) if vals.get(h)}
                     data.append(([comp_feat(c, f) for f in fa],
                                  [comp_feat(c, f) for f in fb], ys, pr))
         if len(data) >= 8:
-            pre_qs = peakshape_quantiles(
-                data, [ctx_t[f] for f in fa], [ctx_t[f] for f in fb])
+            pre_qs = peakshape_quantiles_smooth(
+                data, [ctx_t[f] for f in fa], [ctx_t[f] for f in fb],
+                SMOOTH_BETA)
 
     rows = []
     for row in case["forecast"]:
