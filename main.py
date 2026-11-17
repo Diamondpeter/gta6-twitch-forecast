@@ -1,6 +1,6 @@
 """Forecast GTA VI's launch-day Twitch viewers, hour by hour (Python 3.13, stdlib only).
 
-Model v3: a per-hour ridge regression on comparable launches, in the target's
+Model v4: a per-hour ridge regression on comparable launches, in the target's
 own rollout geometry.
 
 What the data says (leave-one-out over the comparables, and the four practice
@@ -30,18 +30,20 @@ cases scored against their actual release days):
 
 Per forecast hour, a ridge regression (features: ln hour-1 viewers, the
 pre-day liveness a1 = ln(median viewers in the last 6 pre-day hours /
-hour-1 viewers), and its hinge max(0, a1 - 0.3); standardised, lambda 3)
+hour-1 viewers), its hinge max(0, a1 - 0.3), and pre1 = ln(viewers in the
+last pre-day hour / hour-1 viewers) — the pre-day's closing level, which
+tracks how deep the coming midday trough cuts; standardised, lambda 4)
 predicts the shifted log ratio's centre. The five quantiles are that centre
-plus the leave-one-out residuals' distribution (hat-matrix shortcut), as an
-even blend of the residuals' empirical quantiles and a normal fit on their
-IQR. Targets that are not rolling launches fall back to a full-pool ridge on
-(ln v1, (ln v1 - 11)^2); with no usable comparables at all, to the house
-persistence baseline.
+plus the leave-one-out residuals' distribution (hat-matrix shortcut),
+blended 70/30 between a normal fit on the residuals' IQR and their
+empirical quantiles. Targets that are not rolling launches fall back to a
+full-pool ridge on (ln v1, (ln v1 - 11)^2); with no usable comparables at
+all, to the house persistence baseline.
 
-Validation while building: practice cases 0.163 mean pinball (v2: 0.227),
-leave-one-out over the in-class comparables 0.30 (v2 on the same targets:
-see repo history), leave-one-out over all comparables kept honest by the
-gated fallback.
+Validation while building: practice cases 0.147 mean pinball (v2: 0.227,
+v3: 0.162), leave-one-out over the in-class comparables 0.30,
+leave-one-out over all comparables 0.61 (v2: 0.74), the all-comparables
+figure kept honest by the gated fallback.
 
 The grader runs `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim: standard library only, no network. Outside the container,
@@ -65,8 +67,8 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-RIDGE_LAMBDA = 3.0
-RESID_BLEND = 0.5  # empirical share of the quantile blend (rest: normal fit)
+RIDGE_LAMBDA = 4.0
+RESID_BLEND = 0.3  # empirical share of the quantile blend (rest: normal fit)
 HINGE_AT = 0.3
 
 
@@ -188,7 +190,7 @@ def unlock_tier(text):
 # --------------------------------------------------------------------------
 class Comp:
     __slots__ = ("name", "series", "curve", "pre", "logv1", "a1", "a1h",
-                 "logv1sq", "kind", "tier", "use", "v1_over_peak")
+                 "pre1", "logv1sq", "kind", "tier", "use", "v1_over_peak")
 
     def __init__(self, raw):
         self.name = raw.get("name", "")
@@ -214,11 +216,13 @@ class Comp:
             self.logv1 = math.log(v1)
             tail = [v for v in self.pre[-6:] if v and v > 0]
             self.a1 = math.log(median(tail) / v1) if tail else 0.0
+            self.pre1 = math.log(self.pre[-1] / v1) if self.pre else 0.0
             peak = max(self.curve.values())
             self.v1_over_peak = v1 / peak if peak else 0.0
         else:
             self.logv1 = None
             self.a1 = 0.0
+            self.pre1 = 0.0
             self.v1_over_peak = 0.0
         self.a1h = max(0.0, self.a1 - HINGE_AT)
         self.logv1sq = (self.logv1 - 11.0) ** 2 if self.logv1 is not None else 0.0
@@ -328,6 +332,7 @@ def forecast_case(case, name):
     tail = [v for v in own_pre[-6:] if v and v > 0]
     a1_t = math.log(median(tail) / p1) if tail else 0.0
     a1h_t = max(0.0, a1_t - HINGE_AT)
+    pre1_t = math.log(own_pre[-1] / p1) if own_pre else 0.0
     logv1sq_t = (logv1_t - 11.0) ** 2
 
     comps = []
@@ -353,10 +358,11 @@ def forecast_case(case, name):
             for c in in_class:
                 y = c.shifted_log_ratio(target_use, h)
                 if y is not None:
-                    feats.append([c.logv1, c.a1, c.a1h])
+                    feats.append([c.logv1, c.a1, c.a1h, c.pre1])
                     ys.append(y)
             if len(ys) >= 8:
-                log_qs = ridge_quantiles(feats, ys, [logv1_t, a1_t, a1h_t],
+                log_qs = ridge_quantiles(feats, ys,
+                                         [logv1_t, a1_t, a1h_t, pre1_t],
                                          RIDGE_LAMBDA)
                 qs = [p1 * math.exp(v) for v in log_qs]
         if qs is None and comps:
