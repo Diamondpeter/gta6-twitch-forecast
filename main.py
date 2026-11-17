@@ -25,11 +25,14 @@ distribution, in log space: a normal fit (weighted median, weighted IQR scaled
 to a standard deviation, shrunk by 0.9) at 70% and the weighted empirical
 quantiles at 30%. The normal view is the better centre for launches like this
 one; the empirical share keeps honest tails for the hours where past launches
-disagreed wildly.
+disagreed wildly. The normal spread is widened by sqrt(12 / n_eff), capped at
+1.5, where n_eff is the weights' effective sample size: when the kernel
+concentrates on a handful of launches, the fit knows less than the IQR of
+those few suggests.
 
 Validation while building (leave-one-out over the comparables, and the four
 practice cases scored against their actual release days): mean pinball loss on
-the log scale about 0.75 / 0.23, against the persistence baseline's 0.93 / 0.39.
+the log scale about 0.74 / 0.23, against the persistence baseline's 0.93 / 0.39.
 
 The grader runs `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in
 python:3.13-slim: standard library only, no network. Outside the container,
@@ -183,6 +186,7 @@ def forecast_case(case, name):
 
     # Weighted log-ratio samples per hour from the comparables.
     samples = {h: [] for h in range(2, 25)}
+    weights = []
     for comp in case.get("comparables") or []:
         curve = day_curve(comp)
         if len(curve) < 24 or not curve.get(1):
@@ -190,10 +194,20 @@ def forecast_case(case, name):
         feature = launch_feature(pre_day_viewers(comp), curve[1])
         console_only = "PC" not in (comp.get("platforms") or "")
         weight = comparable_weight(feature, target_feature, console_only)
+        weights.append(weight)
         base = curve[1]
         for h in range(2, 25):
             if curve.get(h):
                 samples[h].append((math.log(curve[h] / base), weight))
+
+    # Effective sample size of the weights: a concentrated kernel means the
+    # spread must widen, because fewer launches are really speaking.
+    if weights:
+        total_w = sum(weights)
+        n_eff = total_w * total_w / sum(w * w for w in weights)
+        sd_mult = min(1.5, math.sqrt(max(1.0, 12.0 / n_eff)))
+    else:
+        sd_mult = 1.0
 
     rows = []
     for row in case["forecast"]:
@@ -205,7 +219,7 @@ def forecast_case(case, name):
             med = weighted_quantile(pairs, 0.5)
             q25 = weighted_quantile(pairs, 0.25)
             q75 = weighted_quantile(pairs, 0.75)
-            sd = max(0.08, (q75 - q25) / 1.349) * SD_SHRINK
+            sd = max(0.08, (q75 - q25) / 1.349) * SD_SHRINK * sd_mult
             qs = []
             for tau, z in zip(LEVELS, Z):
                 normal_log = med + z * sd
